@@ -1,0 +1,26 @@
+# Claude
+.claude/
+
+# Training output
+runs/
+models/
+
+# Project data (videos, frames, datasets)
+projects/
+
+# Screenshots
+screenshots/
+
+# YOLO pretrained weights
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
