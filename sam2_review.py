@@ -6,17 +6,19 @@ Usage:
   python sam2_review.py --input dataset_raw
 
 Controls:
-  d / Right     → next frame  (auto-saves)
-  a / Left      → previous frame  (auto-saves)
-  Click bbox    → select (shows corner handles)
-  Drag corner   → resize selected bbox
-  Drag center   → move selected bbox
-  Delete        → delete selected bbox
-  s             → save current frame label
-  q / ESC       → quit
+  d              → next frame  (auto-saves)
+  a              → previous frame  (auto-saves)
+  . (period)     → jump to first frame of next video group
+  , (comma)      → jump to first frame of previous video group
+  Click bbox      → select (shows corner handles)
+  Drag corner     → resize selected bbox
+  Drag center     → move selected bbox
+  Delete          → delete selected bbox
+  q / ESC         → quit
 """
 
 import os
+import re
 import cv2
 import argparse
 import glob as glob_module
@@ -107,6 +109,12 @@ def _hit_box(box, mx, my):
     return x1 <= mx <= x2 and y1 <= my <= y2
 
 
+def _vid_key(filename):
+    """Extract vid prefix from filename, e.g. 'vid003_frame_000001.jpg' → 'vid003'."""
+    m = re.match(r'^(vid\d+)_', os.path.basename(filename))
+    return m.group(1) if m else ''
+
+
 class ReviewUI:
     def __init__(self, image_files, labels_dir, classes, win_w, win_h):
         self.image_files = image_files
@@ -116,6 +124,9 @@ class ReviewUI:
         self.win_h       = win_h
         self.total       = len(image_files)
         self.idx         = 0
+
+        # Build sorted list of (start_idx, vid_key) for PageUp/PageDown navigation
+        self.video_starts = self._build_video_starts()
 
         # Per-frame state
         self.boxes      = []
@@ -133,8 +144,34 @@ class ReviewUI:
 
         self.window = (
             "sam2_review  |  "
-            "d/a=next/prev  Click=select  Drag corner=resize  Drag center=move  Del=delete bbox  q=quit"
+            "d/a=next/prev  ./,=next/prev video  "
+            "Click=select  Drag corner=resize  Drag center=move  Del=delete  q=quit"
         )
+
+    def _build_video_starts(self):
+        """Return list of frame indices where each video group starts."""
+        starts = []
+        prev_key = None
+        for i, f in enumerate(self.image_files):
+            k = _vid_key(f)
+            if k != prev_key:
+                starts.append(i)
+                prev_key = k
+        return starts
+
+    def _jump_to_video(self, direction):
+        """Jump to first frame of next (+1) or previous (-1) video group."""
+        # Find which group we're currently in
+        cur_group = 0
+        for i, start in enumerate(self.video_starts):
+            if start <= self.idx:
+                cur_group = i
+        target_group = cur_group + direction
+        target_group = max(0, min(target_group, len(self.video_starts) - 1))
+        self._auto_save()
+        self.idx = self.video_starts[target_group]
+        self._load_frame()
+        self._redraw()
 
     # ── frame loading ──────────────────────────────────────────────────────────
 
@@ -177,7 +214,11 @@ class ReviewUI:
 
         stem       = os.path.splitext(os.path.basename(self.image_files[self.idx]))[0]
         dirty_mark = "  [unsaved]" if self.dirty else ""
-        status     = f"[{self.idx + 1}/{self.total}]  {stem}  |  boxes: {len(self.boxes)}{dirty_mark}"
+        vid        = _vid_key(self.image_files[self.idx]) or "no-vid"
+        grp_idx    = next((i for i, s in enumerate(self.video_starts) if s <= self.idx), 0)
+        status     = (f"[{self.idx + 1}/{self.total}]  {stem}  |  "
+                      f"video {grp_idx + 1}/{len(self.video_starts)} ({vid})  |  "
+                      f"boxes: {len(self.boxes)}{dirty_mark}")
         cv2.putText(display, status, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220, 220, 220), 2)
         cv2.imshow(self.window, display)
 
@@ -252,22 +293,33 @@ class ReviewUI:
             raw = cv2.waitKey(20)
             if raw == -1:
                 continue
-            key     = raw & 0xFF
-            win_vk  = (raw >> 16) & 0xFF   # Windows special key VK code
+            key    = raw & 0xFF
+            win_vk = (raw >> 16) & 0xFF   # Windows special key VK code (e.g. 0x27=Right)
 
-            if key == ord('d') or win_vk == 0x27:    # d or Right arrow (VK_RIGHT=0x27)
+            # d  → next frame
+            if key == ord('d'):
                 self._auto_save()
                 self.idx = min(self.idx + 1, self.total - 1)
                 self._load_frame()
                 self._redraw()
 
-            elif key == ord('a') or win_vk == 0x25:  # a or Left arrow (VK_LEFT=0x25)
+            # a  → prev frame
+            elif key == ord('a'):
                 self._auto_save()
                 self.idx = max(self.idx - 1, 0)
                 self._load_frame()
                 self._redraw()
 
-            elif key in (255, 127) or win_vk == 0x2E:  # Delete (Linux=255, Windows VK_DELETE=0x2E)
+            # .  → next video group
+            elif key == ord('.'):
+                self._jump_to_video(+1)
+
+            # ,  → prev video group
+            elif key == ord(','):
+                self._jump_to_video(-1)
+
+            # Delete  → remove selected bbox
+            elif key in (255, 127) or win_vk == 0x2E:   # VK_DELETE=0x2E
                 if 0 <= self.selected < len(self.boxes):
                     del self.boxes[self.selected]
                     self.selected = -1

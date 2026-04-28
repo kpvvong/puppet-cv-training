@@ -7,12 +7,13 @@ Supports multiple videos per project; frame numbers are
 incremented continuously across videos.
 
 Usage:
-  python sam2_annotate.py --project <project_name> [--classes Puppet,Hand]
+  python sam2_annotate.py --project <project_name> [--classes Puppet,Hand] [--model sam2_hiera_large.pt] [--preview] [--reannotate vid003]
 
 Controls (interactive window):
   Left click  → add foreground point (tell SAM2 "this is the object")
   Right click → add background point (tell SAM2 "this is NOT the object")
   n           → next object (use different IDs for multiple puppets)
+  c           → new class
   u           → undo last point
   Enter/Space → confirm and start tracking
   ESC         → skip this video
@@ -25,6 +26,7 @@ Output (same format as extract_frames.py):
 """
 
 import os
+import re
 import cv2
 import numpy as np
 import torch
@@ -33,13 +35,33 @@ import argparse
 import shutil
 
 
+def video_sort_key(path):
+    """Sort by the last number in the filename, fallback to full name."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    nums = re.findall(r'\d+', stem)
+    return (int(nums[-1]), stem) if nums else (0, stem)
+
+
+def video_id(path):
+    """Extract the last number from the filename as the vid index.
+    e.g. clip_003.mp4 → 3,  recording.mp4 → fallback to sort position.
+    Returns None if no number found (caller uses enumerate index instead).
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    nums = re.findall(r'\d+', stem)
+    return int(nums[-1]) if nums else None
+
+
 def find_project_videos(project_name):
     project_dir = os.path.join("projects", project_name)
     if not os.path.isdir(project_dir):
         print(f"[ERROR] Project folder not found: {project_dir}")
         return None, None
 
-    video_files = sorted(glob_module.glob(os.path.join(project_dir, "**", "*.mp4"), recursive=True))
+    video_files = sorted(
+        glob_module.glob(os.path.join(project_dir, "**", "*.mp4"), recursive=True),
+        key=video_sort_key,
+    )
     if not video_files:
         print(f"[ERROR] No .mp4 files found in {project_dir}")
         return None, None
@@ -93,36 +115,41 @@ class PointSelector:
     EXCL_GRID  = 4             # NxN background points sampled inside each exclusion box
 
     def __init__(self, frames_dir, total_frames, video_label, win_w=1280, win_h=720):
-        self.frames_dir     = frames_dir
-        self.total_frames   = total_frames
-        self.frame_idx      = 0
-        self.frame          = self._load_frame(0)
-        # obj_id -> {"mode": "point"|"box", "points": [(x,y,lbl),...],
+        self.frames_dir      = frames_dir
+        self.total_frames    = total_frames
+        self.frame_idx       = 0
+        self.frame           = self._load_frame(0)
+        # obj_id -> {"class_id": int, "mode": "point"|"box",
+        #            "points": [(x,y,lbl),...],
         #            "box": (x1,y1,x2,y2)|None, "excl_boxes": [(x1,y1,x2,y2),...]}
-        self.objects        = {}
-        self.current_obj_id = 1
-        self.box_mode       = False
-        self._drag_start    = None  # (x, y, button)  button: 1=left, 3=right
-        self._drag_cur      = None
-        self.win_w          = win_w
-        self.win_h          = win_h
+        self.objects         = {}
+        self.current_obj_id  = 1
+        self.current_class_id = 0   # shared across instances; 'c' increments this
+        self.box_mode        = True  # start in box mode since it's more efficient for most objects
+        self._drag_start     = None  # (x, y, button)  button: 1=left, 3=right
+        self._drag_cur       = None
+        self.win_w           = win_w
+        self.win_h           = win_h
         self.window = (
             f"[{video_label}]  "
-            "d/a=prev/next frame  b=box/point  n=new obj  u=undo  Enter=track  ESC=skip  |  "
+            "d/a=frame  b=box/point  n=new instance(same class)  c=new class  u=undo  Enter=track  ESC=skip  |  "
             "POINT: LClick=fg  RClick=bg  |  "
-            "BOX: LDrag=fg box  RDrag=exclusion box"
+            "BOX: LDrag=fg box  RDrag=excl box"
         )
 
     def _load_frame(self, idx):
         return cv2.imread(os.path.join(self.frames_dir, f"{idx:06d}.jpg"))
 
     def _color(self, obj_id):
-        return self.COLORS[(obj_id - 1) % len(self.COLORS)]
+        obj = self.objects.get(obj_id)
+        class_id = obj["class_id"] if obj else self.current_class_id
+        return self.COLORS[class_id % len(self.COLORS)]
 
     def _current(self):
         obj = self.objects.setdefault(
             self.current_obj_id,
-            {"mode": "box" if self.box_mode else "point",
+            {"class_id": self.current_class_id,
+             "mode": "box" if self.box_mode else "point",
              "points": [], "box": None, "excl_boxes": []},
         )
         obj["mode"] = "box" if self.box_mode else "point"
@@ -190,8 +217,8 @@ class PointSelector:
 
         cur_color  = self._color(self.current_obj_id)
         mode_label = "BOX" if self.box_mode else "POINT"
-        cv2.putText(display, f"Object {self.current_obj_id}  [{mode_label}]", (10, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, cur_color, 2)
+        cv2.putText(display, f"Class {self.current_class_id}  Instance {self.current_obj_id}  [{mode_label}]",
+                    (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, cur_color, 2)
         cv2.putText(display, f"Frame {self.frame_idx}/{self.total_frames - 1}", (10, 62),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
         cv2.imshow(self.window, display)
@@ -247,8 +274,15 @@ class PointSelector:
                 print(f"  Mode: {mode}")
                 self._redraw()
             elif key == ord('n'):
+                # New instance of the same class
                 self.current_obj_id += 1
-                print(f"  Switched to object {self.current_obj_id}")
+                print(f"  New instance: class {self.current_class_id}, instance {self.current_obj_id}")
+                self._redraw()
+            elif key == ord('c'):
+                # New class
+                self.current_class_id += 1
+                self.current_obj_id += 1
+                print(f"  New class: class {self.current_class_id}, instance {self.current_obj_id}")
                 self._redraw()
             elif key == ord('u'):
                 obj = self.objects.get(self.current_obj_id)
@@ -304,14 +338,89 @@ def draw_bboxes(frame, lines, classes, frame_w, frame_h):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="SAM2 video auto-annotation → YOLO format")
-    parser.add_argument("--project", required=True,                        help="Project name (projects/{name}/)")
-    parser.add_argument("--classes", default=None,                         help="Class names, comma-separated, in object ID order (e.g. Puppet,Hand)")
-    parser.add_argument("--model",   default="sam2_hiera_large.pt",        help="SAM2 checkpoint filename (place in models/)")
-    parser.add_argument("--config",  default="configs/sam2/sam2_hiera_l.yaml", help="SAM2 config path (relative to sam2 package)")
-    parser.add_argument("--device",  default="cuda",                       help="Device (default: cuda)")
-    parser.add_argument("--preview", action="store_true",                  help="Show live preview window during tracking (ESC to abort)")
-    parser.add_argument("--window-size", default="1280x720",               help="Initial window size WxH (default: 1280x720)")
+    parser.add_argument("--project", required=True,                             help="Project name (projects/{name}/)")
+    parser.add_argument("--classes", default=None,                              help="Class names, comma-separated (e.g. Puppet,Hand)")
+    parser.add_argument("--model",   default="sam2_hiera_large.pt",             help="SAM2 checkpoint filename (place in models/)")
+    parser.add_argument("--config",  default="configs/sam2/sam2_hiera_l.yaml",  help="SAM2 config path (relative to sam2 package)")
+    parser.add_argument("--device",  default="cuda",                            help="Device (default: cuda)")
+    parser.add_argument("--preview", action="store_true",                       help="Show live preview window during tracking (ESC to abort)")
+    parser.add_argument("--window-size", default="1280x720",                    help="Initial window size WxH (default: 1280x720)")
+    parser.add_argument("--reannotate", default=None, metavar="VID",
+                        help="Re-annotate a specific video group in dataset_raw "
+                             "(e.g. --reannotate vid003). Replaces existing labels for that group.")
     return parser.parse_args()
+
+
+def _run_annotation(predictor, frames_dir, total_frames, frame_w, frame_h,
+                    video_label, win_w, win_h, args, classes):
+    """Run interactive annotation + SAM2 tracking for one video/group.
+
+    Generator that yields (frame_idx, lines, saved_idx) for each tracked frame.
+    Yields nothing if the user skips or aborts.
+    """
+    print("  Navigate to a frame with the object visible, then click to annotate (ESC to skip)")
+    selector = PointSelector(frames_dir, total_frames, video_label, win_w, win_h)
+    selected, anchor_frame = selector.run()
+
+    if selected is None:
+        return  # skipped — generator yields nothing
+
+    obj_class_map = {obj_id: obj["class_id"] for obj_id, obj in selected.items()}
+    max_class_id  = max(obj_class_map.values())
+    while len(classes) <= max_class_id:
+        classes.append(f"object_{len(classes)}")
+
+    saved = 0
+    with torch.inference_mode():
+        state = predictor.init_state(video_path=frames_dir)
+
+        for obj_id, obj in selected.items():
+            kwargs = dict(inference_state=state, frame_idx=anchor_frame, obj_id=obj_id)
+            if obj["mode"] == "box" and obj["box"]:
+                x1, y1, x2, y2 = obj["box"]
+                kwargs["box"] = np.array([x1, y1, x2, y2], dtype=np.float32)
+                all_pts = list(obj["points"]) + selector.excl_boxes_to_bg_points(obj["excl_boxes"])
+                if all_pts:
+                    kwargs["points"] = np.array([[x, y] for x, y, _ in all_pts], dtype=np.float32)
+                    kwargs["labels"] = np.array([lbl for _, _, lbl in all_pts], dtype=np.int32)
+            else:
+                kwargs["points"] = np.array([[x, y] for x, y, _ in obj["points"]], dtype=np.float32)
+                kwargs["labels"] = np.array([lbl for _, _, lbl in obj["points"]], dtype=np.int32)
+            predictor.add_new_points_or_box(**kwargs)
+
+        print(f"  Tracking ({total_frames} frames)..." + (" Press ESC to abort." if args.preview else ""))
+        for frame_idx, obj_ids, masks in predictor.propagate_in_video(state):
+            lines = []
+            for i, obj_id in enumerate(obj_ids):
+                mask = masks[i][0].cpu().numpy() > 0.0
+                bbox = mask_to_yolo_bbox(mask, frame_h, frame_w)
+                if bbox is None:
+                    continue
+                class_id = obj_class_map.get(obj_id, obj_id - 1)
+                cx, cy, w, h = bbox
+                lines.append(f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+
+            if not lines:
+                continue
+
+            if args.preview:
+                preview_win = f"Preview: {video_label}"
+                preview = cv2.imread(os.path.join(frames_dir, f"{frame_idx:06d}.jpg"))
+                draw_bboxes(preview, lines, classes, frame_w, frame_h)
+                cv2.putText(preview, f"frame {frame_idx}  ESC=abort", (10, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+                cv2.namedWindow(preview_win, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(preview_win, win_w, win_h)
+                cv2.imshow(preview_win, preview)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    print("  Tracking aborted by user")
+                    break
+
+            yield frame_idx, lines, saved
+            saved += 1
+
+    if args.preview:
+        cv2.destroyAllWindows()
 
 
 def main():
@@ -325,6 +434,119 @@ def main():
         print(f"[ERROR] Invalid --window-size format '{args.window_size}', expected WxH (e.g. 1280x720)")
         return
 
+    project_dir = os.path.join("projects", args.project)
+    output_dir  = os.path.join(project_dir, "dataset_raw")
+    images_dir  = os.path.join(output_dir, "images")
+    labels_dir  = os.path.join(output_dir, "labels")
+
+    device = args.device if torch.cuda.is_available() else "cpu"
+    print(f"\nLoading SAM2 ({device})...")
+    predictor = build_sam2_video_predictor(args.config, f"models/{args.model}", device=device)
+
+    # ── Re-annotate mode ──────────────────────────────────────────────────────
+    if args.reannotate:
+        vid_prefix = args.reannotate.lower()  # e.g. "vid003"
+        # Collect existing frames for this group
+        group_frames = sorted(
+            f for f in glob_module.glob(os.path.join(images_dir, f"{vid_prefix}_frame_*.jpg"))
+        )
+        # Read classes from existing classes.txt
+        classes_path = os.path.join(output_dir, "classes.txt")
+        classes = []
+        if os.path.exists(classes_path):
+            with open(classes_path) as f:
+                classes = [l.strip() for l in f if l.strip()]
+        if args.classes:
+            classes = args.classes.split(",")
+
+        if group_frames:
+            # ── Re-annotate existing frames (overwrite labels only) ───────────
+            print(f"\nRe-annotating {vid_prefix}: {len(group_frames)} frames")
+
+            frames_dir = os.path.join(output_dir, f"_sam2_reannotate_{vid_prefix}")
+            os.makedirs(frames_dir, exist_ok=True)
+            for i, src in enumerate(group_frames):
+                shutil.copy(src, os.path.join(frames_dir, f"{i:06d}.jpg"))
+
+            import cv2 as _cv2
+            _img = _cv2.imread(group_frames[0])
+            frame_h, frame_w = _img.shape[:2]
+            total_frames = len(group_frames)
+
+            saved = 0
+            for frame_idx, lines, saved_idx in _run_annotation(
+                predictor, frames_dir, total_frames, frame_w, frame_h,
+                vid_prefix, win_w, win_h, args, classes
+            ):
+                orig_name = os.path.splitext(os.path.basename(group_frames[frame_idx]))[0]
+                with open(os.path.join(labels_dir, f"{orig_name}.txt"), "w") as f:
+                    f.write("\n".join(lines))
+                saved += 1
+
+            shutil.rmtree(frames_dir)
+            print(f"\nRe-annotation done: {saved} labels updated for {vid_prefix}")
+
+        else:
+            # ── No existing frames — find source video and annotate from scratch
+            vid_num_match = re.match(r'vid(\d+)', vid_prefix)
+            target_vid_num = int(vid_num_match.group(1)) if vid_num_match else None
+
+            video_files, _ = find_project_videos(args.project)
+            if not video_files:
+                print(f"[ERROR] No videos found in project '{args.project}'")
+                return
+
+            # Match by video_id number
+            matched_video = None
+            for vf in video_files:
+                if video_id(vf) == target_vid_num:
+                    matched_video = vf
+                    break
+
+            if matched_video is None:
+                print(f"[ERROR] No frames for '{vid_prefix}' in dataset_raw and no matching video found")
+                print(f"  Available videos:")
+                for vf in video_files:
+                    vn = video_id(vf)
+                    print(f"    {os.path.basename(vf)}  →  vid{vn:03d}" if vn is not None else f"    {os.path.basename(vf)}")
+                return
+
+            print(f"\nNo existing frames for {vid_prefix}, annotating from video: {os.path.basename(matched_video)}")
+            os.makedirs(images_dir, exist_ok=True)
+            os.makedirs(labels_dir, exist_ok=True)
+
+            frames_dir = os.path.join(output_dir, f"_sam2_reannotate_{vid_prefix}")
+            total_frames, frame_w, frame_h = extract_all_frames(matched_video, frames_dir)
+            if total_frames == 0:
+                shutil.rmtree(frames_dir, ignore_errors=True)
+                print(f"[ERROR] Could not extract frames from {matched_video}")
+                return
+
+            saved = 0
+            for frame_idx, lines, saved_idx in _run_annotation(
+                predictor, frames_dir, total_frames, frame_w, frame_h,
+                os.path.basename(matched_video), win_w, win_h, args, classes
+            ):
+                name = f"{vid_prefix}_frame_{saved_idx:06d}"
+                shutil.copy(
+                    os.path.join(frames_dir, f"{frame_idx:06d}.jpg"),
+                    os.path.join(images_dir, f"{name}.jpg"),
+                )
+                with open(os.path.join(labels_dir, f"{name}.txt"), "w") as f:
+                    f.write("\n".join(lines))
+                saved += 1
+
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            if saved == 0:
+                print(f"  Skipped")
+            else:
+                print(f"\nDone: annotated {saved} frames as {vid_prefix}")
+
+        with open(os.path.join(output_dir, "classes.txt"), "w") as f:
+            f.write("\n".join(classes))
+        return
+
+    # ── Normal annotation mode ────────────────────────────────────────────────
     video_files, output_dir = find_project_videos(args.project)
     if not video_files:
         return
@@ -333,108 +555,44 @@ def main():
     for v in video_files:
         print(f"  {v}")
 
-    images_dir = os.path.join(output_dir, "images")
-    labels_dir = os.path.join(output_dir, "labels")
     os.makedirs(images_dir, exist_ok=True)
     os.makedirs(labels_dir, exist_ok=True)
 
     classes = args.classes.split(",") if args.classes else []
-
-    device = args.device if torch.cuda.is_available() else "cpu"
-    print(f"\nLoading SAM2 ({device})...")
-    predictor = build_sam2_video_predictor(args.config, f"models/{args.model}", device=device)
-
     global_frame_count = 0
 
-    for video_idx, video_path in enumerate(video_files):
+    for enum_idx, video_path in enumerate(video_files):
+        vid_num     = video_id(video_path)
+        video_idx   = vid_num if vid_num is not None else enum_idx
         video_label = os.path.basename(video_path)
-        print(f"\n[{video_idx + 1}/{len(video_files)}] {video_label}")
+        print(f"\n[{enum_idx + 1}/{len(video_files)}] {video_label}  →  vid{video_idx:03d}")
 
-        frames_dir = os.path.join(output_dir, f"_sam2_frames_{video_idx}")
+        frames_dir = os.path.join(output_dir, f"_sam2_frames_{enum_idx}")
         total_frames, frame_w, frame_h = extract_all_frames(video_path, frames_dir)
         if total_frames == 0:
             shutil.rmtree(frames_dir, ignore_errors=True)
             continue
 
-        print("  Navigate to a frame with the object visible, then click to annotate (ESC to skip)")
-        selector = PointSelector(frames_dir, total_frames, video_label, win_w, win_h)
-        selected, anchor_frame = selector.run()
-
-        if selected is None:
-            print(f"  Skipped {video_label}")
-            shutil.rmtree(frames_dir, ignore_errors=True)
-            continue
-
-        # Fill in missing class names
-        max_obj_id = max(selected.keys())
-        while len(classes) < max_obj_id:
-            classes.append(f"object_{len(classes) + 1}")
-
         saved = 0
-        with torch.inference_mode():
-            state = predictor.init_state(video_path=frames_dir)
+        for frame_idx, lines, saved_idx in _run_annotation(
+            predictor, frames_dir, total_frames, frame_w, frame_h,
+            video_label, win_w, win_h, args, classes
+        ):
+            name = f"vid{video_idx:03d}_frame_{saved_idx:06d}"
+            shutil.copy(
+                os.path.join(frames_dir, f"{frame_idx:06d}.jpg"),
+                os.path.join(images_dir, f"{name}.jpg"),
+            )
+            with open(os.path.join(labels_dir, f"{name}.txt"), "w") as f:
+                f.write("\n".join(lines))
+            global_frame_count += 1
+            saved += 1
 
-            for obj_id, obj in selected.items():
-                kwargs = dict(inference_state=state, frame_idx=anchor_frame, obj_id=obj_id)
-                if obj["mode"] == "box" and obj["box"]:
-                    x1, y1, x2, y2 = obj["box"]
-                    kwargs["box"] = np.array([x1, y1, x2, y2], dtype=np.float32)
-                    # Merge explicit points + background points sampled from exclusion boxes
-                    all_pts = list(obj["points"]) + selector.excl_boxes_to_bg_points(obj["excl_boxes"])
-                    if all_pts:
-                        kwargs["points"] = np.array([[x, y] for x, y, _ in all_pts], dtype=np.float32)
-                        kwargs["labels"] = np.array([lbl for _, _, lbl in all_pts], dtype=np.int32)
-                else:
-                    kwargs["points"] = np.array([[x, y] for x, y, _ in obj["points"]], dtype=np.float32)
-                    kwargs["labels"] = np.array([lbl for _, _, lbl in obj["points"]], dtype=np.int32)
-                predictor.add_new_points_or_box(**kwargs)
-
-            print(f"  Tracking ({total_frames} frames)..." + (" Press ESC to abort." if args.preview else ""))
-            aborted = False
-            for frame_idx, obj_ids, masks in predictor.propagate_in_video(state):
-                lines = []
-                for i, obj_id in enumerate(obj_ids):
-                    mask = masks[i][0].cpu().numpy() > 0.0
-                    bbox = mask_to_yolo_bbox(mask, frame_h, frame_w)
-                    if bbox is None:
-                        continue
-                    class_id = obj_id - 1  # obj_id starts at 1, class_id at 0
-                    cx, cy, w, h = bbox
-                    lines.append(f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
-
-                if not lines:
-                    continue
-
-                if args.preview:
-                    preview_win = f"Preview: {video_label}"
-                    preview = cv2.imread(os.path.join(frames_dir, f"{frame_idx:06d}.jpg"))
-                    draw_bboxes(preview, lines, classes, frame_w, frame_h)
-                    cv2.putText(preview, f"frame {frame_idx}  ESC=abort", (10, 28),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-                    cv2.namedWindow(preview_win, cv2.WINDOW_NORMAL)
-                    cv2.resizeWindow(preview_win, win_w, win_h)
-                    cv2.imshow(preview_win, preview)
-                    if cv2.waitKey(1) & 0xFF == 27:  # ESC
-                        print("  Tracking aborted by user")
-                        aborted = True
-                        break
-
-                name = f"frame_{global_frame_count:06d}"
-                shutil.copy(
-                    os.path.join(frames_dir, f"{frame_idx:06d}.jpg"),
-                    os.path.join(images_dir, f"{name}.jpg"),
-                )
-                with open(os.path.join(labels_dir, f"{name}.txt"), "w") as f:
-                    f.write("\n".join(lines))
-
-                global_frame_count += 1
-                saved += 1
-
-            if args.preview:
-                cv2.destroyAllWindows()
-
-        shutil.rmtree(frames_dir)
-        print(f"  {'Aborted,' if aborted else 'Done,'} annotated {saved} frames")
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        if saved == 0:
+            print(f"  Skipped {video_label}")
+        else:
+            print(f"  Done, annotated {saved} frames")
 
     with open(os.path.join(output_dir, "classes.txt"), "w") as f:
         f.write("\n".join(classes))
